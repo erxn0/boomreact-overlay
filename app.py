@@ -61,30 +61,40 @@ def overlay():
 
         scale = min(1.0, MAX_SIDE / max(w, h))
         W, H = int(w * scale) // 2 * 2, int(h * scale) // 2 * 2
-        t = round(dur / 2, 3)               # middle of the video
-        ms = int(t * 1000)
+        FPS = 30
+        t = round(dur / 2, 3)                      # pause point: middle of the video
+        N = max(1, int(ov_dur * FPS + 0.999))      # frames of the frozen part
+        seg = N / FPS                              # length of the inserted part
 
+        AF = "aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo"
         fc = (
-            f"[0:v]scale={W}:{H},setsar=1,fps=30[bg];"
-            f"[1:v]scale={W}:{H}:force_original_aspect_ratio=decrease,"
-            f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,"
-            f"setpts=PTS-STARTPTS+{t}/TB[ov];"
-            f"[bg][ov]overlay=enable='between(t,{t},{t + ov_dur})':eof_action=pass[v]"
+            # --- video: [0..t] + (frozen frame at t with overlay on top) + [t..end]
+            f"[0:v]scale={W}:{H},setsar=1,fps={FPS},format=yuv420p,split=3[va][vb][vc];"
+            f"[va]trim=end={t},setpts=PTS-STARTPTS[p1];"
+            f"[vb]trim=start={t},setpts=PTS-STARTPTS,select='eq(n,0)',"
+            f"loop=loop={N}:size=1:start=0,setpts=N/({FPS}*TB)[frz];"
+            f"[1:v]scale={W}:{H}:force_original_aspect_ratio=decrease:force_divisible_by=2,"
+            f"setsar=1,fps={FPS},format=yuv420p,setpts=PTS-STARTPTS[ovs];"
+            f"[frz][ovs]overlay=(W-w)/2:(H-h)/2:eof_action=pass[mid];"
+            f"[vc]trim=start={t},setpts=PTS-STARTPTS[p3];"
         )
-        maps = ["-map", "[v]"]
-        if a_main and a_ov:
-            fc += (f";[1:a]adelay={ms}|{ms}[oa];"
-                   f"[0:a][oa]amix=inputs=2:duration=first:normalize=0[a]")
-            maps += ["-map", "[a]"]
-        elif a_main:
-            maps += ["-map", "0:a"]
-        elif a_ov:
-            fc += f";[1:a]adelay={ms}|{ms}[a]"
-            maps += ["-map", "[a]"]
+        # --- audio: main audio is paused while the overlay clip plays
+        if a_main:
+            fc += f"[0:a]{AF},asplit=2[am1][am2];"
+        else:
+            fc += f"anullsrc=r=44100:cl=stereo,atrim=0:{dur},asplit=2[am1][am2];"
+        fc += (
+            f"[am1]atrim=end={t},asetpts=PTS-STARTPTS[a1];"
+            f"[am2]atrim=start={t},asetpts=PTS-STARTPTS[a3];"
+        )
+        if a_ov:
+            fc += f"[1:a]{AF},apad,atrim=0:{seg},asetpts=PTS-STARTPTS[a2];"
+        else:
+            fc += f"anullsrc=r=44100:cl=stereo,atrim=0:{seg},asetpts=PTS-STARTPTS[a2];"
+        fc += "[p1][a1][mid][a2][p3][a3]concat=n=3:v=1:a=1[v][a]"
 
         cmd = ["ffmpeg", "-y", "-v", "error", "-i", src, "-i", ov_path,
-               "-filter_complex", fc, *maps,
-               "-t", str(dur),
+               "-filter_complex", fc, "-map", "[v]", "-map", "[a]",
                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-pix_fmt", "yuv420p",
                "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart", dst]
         try:
